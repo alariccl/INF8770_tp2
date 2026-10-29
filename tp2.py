@@ -1,8 +1,7 @@
 """Experimentation DCT/4:2:0 pour le travail pratique INF8770.
 
-L'estimation de taille des reconstructions quantifie idealement les symboles
-DCT (entropie de Shannon); elle exclut les en-tetes et n'est pas la taille d'un
-fichier JPEG. Le cas 4:2:0 seul estime le stockage brut a 8 bits par echantillon.
+Les tailles rapportees sont les tailles reelles sur disque des PNG reconstruits,
+comparees a celles des PNG sources. Elles ne sont pas des tailles JPEG.
 """
 
 from __future__ import annotations
@@ -162,17 +161,72 @@ def psnr(original: np.ndarray, reconstructed: np.ndarray) -> float:
     return float("inf") if mse == 0 else float(10.0 * np.log10(255.0**2 / mse))
 
 
-def ideal_entropy_bytes(symbols: np.ndarray) -> float:
-    """Estime la taille ideale des symboles avec leur entropie empirique."""
-    _, counts = np.unique(symbols, return_counts=True)
-    probabilities = counts / counts.sum()
-    entropy_bits_per_symbol = -np.sum(probabilities * np.log2(probabilities))
-    return float(symbols.size * entropy_bits_per_symbol / 8.0)
-
-
 def save_rgb(path: Path, rgb: np.ndarray) -> None:
     Image.fromarray(rgb, mode="RGB").save(path)
 
+
+def save_comparison_sheet(path: Path, original: np.ndarray, reconstructions: dict[str, np.ndarray]) -> None:
+    """Cree une planche cote a cote pour comparer les degradations visuellement."""
+    from PIL import ImageDraw
+    labels = ["Originale", *reconstructions.keys()]
+    images = [Image.fromarray(original, mode="RGB")]
+    images.extend(Image.fromarray(image, mode="RGB") for image in reconstructions.values())
+    thumb_width = 320
+    thumb_height = max(1, round(original.shape[0] * thumb_width / original.shape[1]))
+    label_height = 36
+    canvas = Image.new("RGB", (thumb_width * len(images), thumb_height + label_height), "white")
+    draw = ImageDraw.Draw(canvas)
+    for index, (label, image) in enumerate(zip(labels, images)):
+        x = index * thumb_width
+        draw.text((x + 8, 10), label, fill="black")
+        canvas.paste(image.resize((thumb_width, thumb_height), Image.Resampling.LANCZOS), (x, label_height))
+    canvas.save(path)
+
+
+def save_all_images_comparison(
+    path: Path,
+    originals: dict[str, np.ndarray],
+    output_dir: Path,
+) -> None:
+    """Cree une grille commune des originaux et des trois niveaux de quantification."""
+    from PIL import ImageDraw
+
+    levels = ["Originale", *QUANTIZATION_SCALES]
+    cell_width = 320
+    header_height = 36
+    row_label_width = 100
+    first_image = next(iter(originals.values()))
+    thumb_height = max(
+        1, round(first_image.shape[0] * cell_width / first_image.shape[1])
+    )
+    row_height = thumb_height + header_height
+    canvas = Image.new(
+        "RGB",
+        (row_label_width + cell_width * len(levels), row_height * len(originals)),
+        "white",
+    )
+    draw = ImageDraw.Draw(canvas)
+
+    for row_index, (filename, original) in enumerate(originals.items()):
+        stem = Path(filename).stem
+        top = row_index * row_height
+        draw.text((8, top + 10), stem, fill="black")
+        for column_index, level in enumerate(levels):
+            left = row_label_width + column_index * cell_width
+            draw.text((left + 8, top + 10), level, fill="black")
+            if level == "Originale":
+                image = Image.fromarray(original, mode="RGB")
+            else:
+                image_path = output_dir / f"{stem}_{level}.png"
+                with Image.open(image_path) as reconstructed:
+                    image = reconstructed.convert("RGB")
+            canvas.paste(
+                image.resize(
+                    (cell_width, thumb_height), Image.Resampling.LANCZOS
+                ),
+                (left, top + header_height),
+            )
+    canvas.save(path)
 
 def main() -> None:
     root = Path(__file__).resolve().parent
@@ -180,10 +234,12 @@ def main() -> None:
     output_dir.mkdir(exist_ok=True)
 
     images: dict[str, np.ndarray] = {}
+    source_file_sizes: dict[str, int] = {}
     for filename in IMAGE_FILES:
         image_path = root / filename
         if not image_path.is_file():
             raise FileNotFoundError(f"Image requise introuvable : {image_path}")
+        source_file_sizes[filename] = image_path.stat().st_size
         with Image.open(image_path) as image:
             images[filename] = np.asarray(image.convert("RGB"), dtype=np.uint8)
 
@@ -193,7 +249,6 @@ def main() -> None:
 
     height, width, _ = next(iter(images.values())).shape
     pixel_count = height * width
-    raw_rgb_bytes = pixel_count * 3
     result_rows: list[dict[str, object]] = []
 
     matrices_path = output_dir / "matrices_quantification.csv"
@@ -224,10 +279,11 @@ def main() -> None:
             upsample_420(cr_420, (height, width)),
         )
 
-        if filename == IMAGE_FILES[0]:
+        if filename:
             output_path = output_dir / f"{stem}_420_seul.png"
             save_rgb(output_path, chroma_only)
-            raw_420_bytes = int(pixel_count * 1.5)
+            output_file_size = output_path.stat().st_size
+            source_file_size = source_file_sizes[filename]
             result_rows.append(
                 {
                     "image": filename,
@@ -237,11 +293,10 @@ def main() -> None:
                     "coefficients_non_nuls": "",
                     "nombre_coefficients": "",
                     "echantillons_420": int(pixel_count * 1.5),
-                    "taille_estimee_octets": raw_420_bytes,
-                    "methode_estimation": "echantillons bruts 8 bits",
-                    "taille_png_reconstruit_octets": output_path.stat().st_size,
-                    "gain_vs_rgb_brut_pct": 100.0
-                    * (1.0 - raw_420_bytes / raw_rgb_bytes),
+                    "taille_fichier_octets": output_file_size,
+                    "taille_source_octets": source_file_size,
+                    "gain_vs_original_pct": 100.0
+                    * (1.0 - output_file_size / source_file_size),
                 }
             )
 
@@ -252,7 +307,8 @@ def main() -> None:
             output_path = output_dir / f"{stem}_{level}.png"
             save_rgb(output_path, reconstructed)
 
-            estimated_bytes = ideal_entropy_bytes(quantized)
+            output_file_size = output_path.stat().st_size
+            source_file_size = source_file_sizes[filename]
             nonzero_count = int(np.count_nonzero(quantized))
             result_rows.append(
                 {
@@ -263,18 +319,17 @@ def main() -> None:
                     "coefficients_non_nuls": nonzero_count,
                     "nombre_coefficients": int(quantized.size),
                     "echantillons_420": int(pixel_count * 1.5),
-                    "taille_estimee_octets": round(estimated_bytes, 2),
-                    "methode_estimation": "entropie ideale des coefficients DCT",
-                    "taille_png_reconstruit_octets": output_path.stat().st_size,
-                    "gain_vs_rgb_brut_pct": 100.0
-                    * (1.0 - estimated_bytes / raw_rgb_bytes),
+                    "taille_fichier_octets": output_file_size,
+                    "taille_source_octets": source_file_size,
+                    "gain_vs_original_pct": 100.0
+                    * (1.0 - output_file_size / source_file_size),
                 }
             )
             print(
                 f"{filename} | {level:7s} | "
                 f"PSNR={result_rows[-1]['psnr_db']:.2f} dB | "
                 f"coefficients non nuls={nonzero_count}/{quantized.size} | "
-                f"taille estimee={estimated_bytes:.0f} octets"
+                f"taille PNG={output_file_size} octets"
             )
 
     results_path = output_dir / "resultats.csv"
@@ -286,7 +341,21 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(result_rows)
 
+    for filename, original in images.items():
+        stem = Path(filename).stem
+        # reconstructions = {"4:2:0 seul": np.asarray(Image.open(output_dir / f"{stem}_420_seul.png"))}
+        reconstructions = {}
+        for level in QUANTIZATION_SCALES:
+            reconstructions[level] = np.asarray(Image.open(output_dir / f"{stem}_{level}.png"))
+        save_comparison_sheet(output_dir / f"{stem}_comparaison.png", original, reconstructions)
+
+    comparison_path = output_dir / "tableau_comparatif.png"
+    save_all_images_comparison(comparison_path, images, output_dir)
+
     print(f"\nMesures enregistrees dans : {results_path}")
+    print(f"Resume Question 3 : {output_dir / 'rapport_question3.md'}")
+    print(f"Planches comparatives : {output_dir}/*_comparaison.png")
+    print(f"Tableau comparatif des trois images : {comparison_path}")
     print(f"Images reconstruites dans : {output_dir}")
 
 
